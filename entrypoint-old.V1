@@ -1,0 +1,92 @@
+#!/bin/bash
+
+function fail {
+	echo "ERROR: $1" >&2
+	exit 1
+}
+
+function configure {
+	echo $CONF_ROOTPW
+	echo $CONF_BASEDN
+
+	ldapmodify -Y EXTERNAL -H ldapi:/// <<-_EOF
+		dn: olcDatabase={2}hdb,cn=config
+		replace: olcRootPW
+		olcRootPW: $CONF_ROOTPW
+		-
+		replace: olcSuffix
+		olcSuffix: $CONF_BASEDN
+		-
+		replace: olcRootDN
+		olcRootDN: cn=admin,$CONF_BASEDN
+
+		dn: olcDatabase={0}config,cn=config
+		replace: olcRootPW
+		olcRootPW: $CONF_ROOTPW
+
+		dn: olcDatabase={1}monitor,cn=config
+		changetype: modify
+		replace: olcAccess
+		olcAccess: {0}to * by dn.base="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth"
+  			read by dn.base="cn=admin,$CONF_BASEDN" read by * none
+		
+		dn: olcDatabase={2}hdb,cn=config
+		changetype: modify
+		add: olcAccess
+		olcAccess: {0}to attrs=userPassword by dn="cn=admin,$CONF_BASEDN" write by anonymous auth by self write by * none
+		olcAccess: {1}to dn.base="" by * read
+		olcAccess: {2}to * by dn="cn=admin,$CONF_BASEDN" write by * read	
+	_EOF
+	return $?
+}
+
+chown -R ldap:ldap /config /data || fail "Cannot change owner of supplied volumes."
+
+if [[ ! -d '/config/cn=config' ]] ; then
+	# supplied empty config volume, use defaults
+	[[ -z "$CONF_ROOTPW" ]] && fail "No existing config found and CONF_ROOTPW not given."
+	[[ -z "$CONF_BASEDN" ]] && fail "No existing config found and CONF_BASEDN not given."
+	[[ "${CONF_ROOTPW:0:1}" == '{' ]] || CONF_ROOTPW=`slappasswd -s "$CONF_ROOTPW"`
+	cp -a /etc/openldap/slapd.d/. /config/
+	echo "Starting temporary slapd to modify dynamic config."
+	/usr/sbin/slapd -F /config -u ldap -g ldap -h 'ldapi:// ldap://' -d -1 &
+	dpid=$!
+
+	CONFIGURED=0
+	for i in {1..10} ; do
+		sleep 1
+		configure && CONFIGURED=1
+		[[ $CONFIGURED -eq 1 ]] && break
+	done
+	[[ $CONFIGURED -ne 1 ]] && fail "Unable to configure slapd (timeout?)."
+
+	echo "Loading LDIF files from /initdb.d"
+	find /initdb.d -maxdepth 1 -iname '*.ldif' | sort | while read filename ; do
+		echo "* processing $filename"
+		ldapadd -Y EXTERNAL -H ldapi:/// < "$filename"
+		ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/cosine.ldif 
+    		ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/nis.ldif \
+    		ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/inetorgperson.ldif 
+  
+	done
+
+	echo "Stopping temporary slapd."
+	# set timeout
+	function timeout {
+		kill -KILL $dpid
+		fail "Timeout stopping temporary slapd instance."
+	}
+	trap timeout ALRM
+	sleep 5 && kill -ALRM $$ &
+	# kill slapd
+	kill $dpid
+	# wait for slapd exit (or timeout)
+	wait $dpid
+	# clear timeout
+	kill %+
+	trap - ALRM
+fi
+
+echo "Starting slapd."
+exec /usr/sbin/slapd -F /config -u ldap -g ldap -h 'ldapi:// ldap://' -d -1
+
